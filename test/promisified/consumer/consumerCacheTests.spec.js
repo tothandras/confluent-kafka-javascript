@@ -324,3 +324,87 @@ describe.each(cases)('Consumer message cache - isAutoCommit = %s - partitionsCon
         await impatientConsumer.disconnect();
     }, 60000);
 });
+
+describe.each(['eachMessage', 'eachBatch'])('Consumer message cache - %s - partitionsConsumedConcurrently = 2 - while a partition is being processed', (handler) => {
+    let topicName, producer, consumer;
+
+    beforeEach(async () => {
+        topicName = `test-topic-${secureRandom()}`;
+        await createTopic({ topic: topicName, partitions: 2 });
+
+        producer = createProducer({});
+        consumer = createConsumer({
+            groupId: `consumer-group-id-${secureRandom()}`,
+            maxWaitTimeInMs: 100,
+            fromBeginning: true,
+        });
+
+        await producer.connect();
+        await consumer.connect();
+        await consumer.subscribe({ topic: topicName });
+    });
+
+    afterEach(async () => {
+        consumer && (await consumer.disconnect());
+        producer && (await producer.disconnect());
+    });
+
+    /* Starts the consumer with a handler that keeps processing the message on
+     * partition 0 until the message on partition 1 arrives, or 5 seconds pass. */
+    async function runWithSlowPartition() {
+        let otherReceived;
+        const otherArrival = new Promise(resolve => { otherReceived = resolve; });
+        const consumed = [];
+        let processingSlowMessage = false;
+        let otherConsumedWhileSlow = false;
+
+        const process = async (partition, messages) => {
+            consumed.push(...messages);
+            if (partition === 0) {
+                processingSlowMessage = true;
+                await Promise.race([otherArrival, sleep(5000)]);
+                processingSlowMessage = false;
+            } else {
+                otherConsumedWhileSlow = processingSlowMessage;
+                otherReceived();
+            }
+        };
+        consumer.run({
+            partitionsConsumedConcurrently: 2,
+            [handler]: async ({ partition, message, batch }) =>
+                batch ? process(batch.partition, batch.messages) : process(partition, [message]),
+        });
+
+        await producer.send({ topic: topicName, messages: [{ value: 'slow', partition: 0 }] });
+        await waitFor(() => processingSlowMessage, () => null, { delay: 10 });
+        return {
+            consumed,
+            otherConsumedWhileSlow: () => otherConsumedWhileSlow,
+        };
+    }
+
+    it('consumes messages of other partitions', async () => {
+        const { consumed, otherConsumedWhileSlow } = await runWithSlowPartition();
+
+        await producer.send({ topic: topicName, messages: [{ value: 'other', partition: 1 }] });
+        await waitForMessages(consumed, { number: 2 });
+
+        expect(otherConsumedWhileSlow()).toBe(true);
+    });
+
+    it('does not poll in a busy loop', async () => {
+        const internalClient = consumer._getInternalClient();
+        const consume = internalClient.consume.bind(internalClient);
+        let consumeCalls = 0;
+        internalClient.consume = (...args) => {
+            consumeCalls++;
+            return consume(...args);
+        };
+
+        await runWithSlowPartition();
+        const consumeCallsBefore = consumeCalls;
+        await sleep(3000);
+
+        expect(consumeCalls - consumeCallsBefore).toBeLessThan(100);
+    });
+});
